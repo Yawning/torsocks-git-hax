@@ -1,0 +1,423 @@
+From a0927e5315d82a69a17daff720f6e6c121610d5e Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Sun, 5 Apr 2015 06:55:11 +0000
+Subject: [PATCH 1/1] Ensure that torsocks initializes itself in the presence
+ of C++.
+
+Fun fact, `__attribute__(constructor)` functions aren't guaranteed to
+be called before C++ static object constructors.  This change ensures
+that initialization will always be called once (and only once), as
+needed even if C++ codebases chose to use hijacked symbols in ctors
+for static objects.
+
+Things that got changed:
+ * Added `tsocks_once()` that is a functional replica of pthread_once,
+   but doesn't require linking in a real pthread library if the
+   application does not.
+ * Changed the initialization/cleanup to use tsocks_once.
+ * Call the initialization from within all of the hijacked libc calls.
+
+Fixes bug #15584.
+---
+ src/common/compat.c     | 25 +++++++++++++++++++++++++
+ src/common/compat.h     | 11 +++++++++++
+ src/common/connection.c |  7 +++++--
+ src/lib/accept.c        |  2 ++
+ src/lib/close.c         |  2 ++
+ src/lib/connect.c       |  2 ++
+ src/lib/fclose.c        |  6 +++++-
+ src/lib/getaddrinfo.c   |  1 +
+ src/lib/gethostbyname.c |  6 ++++++
+ src/lib/getpeername.c   |  1 +
+ src/lib/listen.c        |  1 +
+ src/lib/recv.c          |  2 +-
+ src/lib/sendto.c        |  1 +
+ src/lib/socket.c        |  2 ++
+ src/lib/socketpair.c    |  2 +-
+ src/lib/syscall.c       |  1 +
+ src/lib/torsocks.c      | 38 +++++++++++++++++++++-----------------
+ src/lib/torsocks.h      |  1 +
+ 18 files changed, 89 insertions(+), 22 deletions(-)
+
+diff --git a/src/common/compat.c b/src/common/compat.c
+index 7d8431d..2969917 100644
+--- a/src/common/compat.c
++++ b/src/common/compat.c
+@@ -71,4 +71,29 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m)
+ 	assert(!ret);
+ }
+ 
++/*
++ * Call the given routine once, and only once.  tsocks_once returning
++ * guarantees that the routine has succeded.
++ */
++void tsocks_once(tsocks_once_t *o, void (*init_routine)(void))
++{
++	/* Why, yes, pthread_once(3P) exists.  Said routine requires linking
++	 * in a real pthread library on Linux, while this does not and will
++	 * do the right thing even with the stub implementation.
++	 */
++	assert(o);
++
++	/* This looks scary and incorrect, till you realize that the
++	 * pthread_mutex routines include memory barriers.
++	 */
++	if (!o->once)
++		return;
++	pthread_mutex_lock(&o->mutex);
++	if (o->once) {
++		init_routine();
++		o->once = 0;
++	}
++	pthread_mutex_unlock(&o->mutex);
++}
++
+ #endif /* __GLIBC__, __darwin__, __FreeBSD__, __NetBSD__ */
+diff --git a/src/common/compat.h b/src/common/compat.h
+index 766b1fd..4095eea 100644
+--- a/src/common/compat.h
++++ b/src/common/compat.h
+@@ -41,6 +41,17 @@ void tsocks_mutex_destroy(tsocks_mutex_t *m);
+ void tsocks_mutex_lock(tsocks_mutex_t *m);
+ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ 
++typedef struct tsocks_once_t {
++	pthread_mutex_t mutex;
++	int once;
++} tsocks_once_t;
++
++/* Define a tsock once variable, statically initialized. */
++#define TSOCKS_INIT_ONCE(name) \
++	tsocks_once_t name = { .mutex = PTHREAD_MUTEX_INITIALIZER, .once = 1 }
++
++void tsocks_once(tsocks_once_t *o, void (*init_routine)(void));
++
+ #else
+ #error "OS not supported."
+ #endif /* __GLIBC__, __darwin__, __FreeBSD__, __NetBSD__ */
+diff --git a/src/common/connection.c b/src/common/connection.c
+index 4c75579..3559d9d 100644
+--- a/src/common/connection.c
++++ b/src/common/connection.c
+@@ -82,7 +82,7 @@ static inline unsigned int conn_hash_fct(struct connection *c)
+ /*
+  * Declare the connection registry.
+  */
+-static HT_HEAD(connection_registry, connection) connection_registry_root;
++static HT_HEAD(connection_registry, connection) connection_registry_root = HT_INITIALIZER();
+ HT_PROTOTYPE(connection_registry, connection, node, conn_hash_fct,
+ 		conn_equal_fct);
+ HT_GENERATE(connection_registry, connection, node, conn_hash_fct,
+@@ -112,7 +112,10 @@ void connection_registry_unlock(void)
+ ATTR_HIDDEN
+ void connection_registry_init(void)
+ {
+-	HT_INIT(connection_registry, &connection_registry_root);
++	/*
++	 * All initialization is static.  If this ever changes, fclose(3)'s
++	 * implementation in src/lib/fclose.c will need changes.
++	 */
+ }
+ 
+ /*
+diff --git a/src/lib/accept.c b/src/lib/accept.c
+index e9bc36c..21714cb 100644
+--- a/src/lib/accept.c
++++ b/src/lib/accept.c
+@@ -85,6 +85,7 @@ error:
+ LIBC_ACCEPT_DECL
+ {
+ 	if (!tsocks_libc_accept) {
++		tsocks_initialize();
+ 		tsocks_libc_accept = tsocks_find_libc_symbol(
+ 				LIBC_ACCEPT_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+@@ -158,6 +159,7 @@ error:
+ LIBC_ACCEPT4_DECL
+ {
+ 	if (!tsocks_libc_accept4) {
++		tsocks_initialize();
+ 		tsocks_libc_accept4 = tsocks_find_libc_symbol(
+ 				LIBC_ACCEPT4_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+diff --git a/src/lib/close.c b/src/lib/close.c
+index d774c85..973399c 100644
+--- a/src/lib/close.c
++++ b/src/lib/close.c
+@@ -61,5 +61,7 @@ LIBC_CLOSE_RET_TYPE tsocks_close(LIBC_CLOSE_SIG)
+  */
+ LIBC_CLOSE_DECL
+ {
++	if (!tsocks_libc_close)
++		tsocks_initialize();
+ 	return tsocks_close(LIBC_CLOSE_ARGS);
+ }
+diff --git a/src/lib/connect.c b/src/lib/connect.c
+index 1bf81ac..2480643 100644
+--- a/src/lib/connect.c
++++ b/src/lib/connect.c
+@@ -231,5 +231,7 @@ error:
+  */
+ LIBC_CONNECT_DECL
+ {
++	if (!tsocks_libc_connect)
++		tsocks_initialize();
+ 	return tsocks_connect(LIBC_CONNECT_ARGS);
+ }
+diff --git a/src/lib/fclose.c b/src/lib/fclose.c
+index 8d371cd..4b0ef9d 100644
+--- a/src/lib/fclose.c
++++ b/src/lib/fclose.c
+@@ -76,10 +76,14 @@ error:
+  */
+ LIBC_FCLOSE_DECL
+ {
++	/* fclose(3) is unique in that it does not call torsocks_initialize(),
++	 * as it is used from within the initialization routine to close the
++	 * config file/log file.  This would be a problem, except that all of
++	 * the global state it depends on is statically initialized.
++	 */
+ 	if (!tsocks_libc_fclose) {
+ 		tsocks_libc_fclose = tsocks_find_libc_symbol(
+ 				LIBC_FCLOSE_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+-
+ 	return tsocks_fclose(LIBC_FCLOSE_ARGS);
+ }
+diff --git a/src/lib/getaddrinfo.c b/src/lib/getaddrinfo.c
+index 378f87f..6518720 100644
+--- a/src/lib/getaddrinfo.c
++++ b/src/lib/getaddrinfo.c
+@@ -122,6 +122,7 @@ error:
+ LIBC_GETADDRINFO_DECL
+ {
+ 	if (!tsocks_libc_getaddrinfo) {
++		tsocks_initialize();
+ 		tsocks_libc_getaddrinfo = tsocks_find_libc_symbol(
+ 				LIBC_GETADDRINFO_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+diff --git a/src/lib/gethostbyname.c b/src/lib/gethostbyname.c
+index 322f398..93a3483 100644
+--- a/src/lib/gethostbyname.c
++++ b/src/lib/gethostbyname.c
+@@ -109,6 +109,7 @@ error:
+  */
+ LIBC_GETHOSTBYNAME_DECL
+ {
++	tsocks_initialize();
+ 	return tsocks_gethostbyname(LIBC_GETHOSTBYNAME_ARGS);
+ }
+ 
+@@ -137,6 +138,7 @@ LIBC_GETHOSTBYNAME2_RET_TYPE tsocks_gethostbyname2(LIBC_GETHOSTBYNAME2_SIG)
+  */
+ LIBC_GETHOSTBYNAME2_DECL
+ {
++	tsocks_initialize();
+ 	return tsocks_gethostbyname2(LIBC_GETHOSTBYNAME2_ARGS);
+ }
+ 
+@@ -202,6 +204,7 @@ error:
+  */
+ LIBC_GETHOSTBYADDR_DECL
+ {
++	tsocks_initialize();
+ 	return tsocks_gethostbyaddr(LIBC_GETHOSTBYADDR_ARGS);
+ }
+ 
+@@ -305,6 +308,7 @@ error:
+  */
+ LIBC_GETHOSTBYADDR_R_DECL
+ {
++	tsocks_initialize();
+ 	return tsocks_gethostbyaddr_r(LIBC_GETHOSTBYADDR_R_ARGS);
+ }
+ 
+@@ -380,6 +384,7 @@ error:
+  */
+ LIBC_GETHOSTBYNAME_R_DECL
+ {
++	tsocks_initialize();
+ 	return tsocks_gethostbyname_r(LIBC_GETHOSTBYNAME_R_ARGS);
+ }
+ 
+@@ -410,5 +415,6 @@ LIBC_GETHOSTBYNAME2_R_RET_TYPE tsocks_gethostbyname2_r(LIBC_GETHOSTBYNAME2_R_SIG
+  */
+ LIBC_GETHOSTBYNAME2_R_DECL
+ {
++	tsocks_initialize();
+ 	return tsocks_gethostbyname2_r(LIBC_GETHOSTBYNAME2_R_ARGS);
+ }
+diff --git a/src/lib/getpeername.c b/src/lib/getpeername.c
+index bd93a2b..bce8bf8 100644
+--- a/src/lib/getpeername.c
++++ b/src/lib/getpeername.c
+@@ -104,6 +104,7 @@ libc:
+ LIBC_GETPEERNAME_DECL
+ {
+ 	if (!tsocks_libc_getpeername) {
++		tsocks_initialize();
+ 		tsocks_libc_getpeername = tsocks_find_libc_symbol(
+ 				LIBC_GETPEERNAME_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+diff --git a/src/lib/listen.c b/src/lib/listen.c
+index 38c37d8..5f675c4 100644
+--- a/src/lib/listen.c
++++ b/src/lib/listen.c
+@@ -80,6 +80,7 @@ error:
+ LIBC_LISTEN_DECL
+ {
+ 	if (!tsocks_libc_listen) {
++		tsocks_initialize();
+ 		tsocks_libc_listen = tsocks_find_libc_symbol(
+ 				LIBC_LISTEN_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+diff --git a/src/lib/recv.c b/src/lib/recv.c
+index 6e8a20a..1ff1446 100644
+--- a/src/lib/recv.c
++++ b/src/lib/recv.c
+@@ -179,7 +179,7 @@ error:
+ LIBC_RECVMSG_DECL
+ {
+ 	if (!tsocks_libc_recvmsg) {
+-		/* Find symbol if not already set. Exit if not found. */
++		tsocks_initialize();
+ 		tsocks_libc_recvmsg = tsocks_find_libc_symbol(LIBC_RECVMSG_NAME_STR,
+ 				TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+diff --git a/src/lib/sendto.c b/src/lib/sendto.c
+index 3362026..6b1d3ff 100644
+--- a/src/lib/sendto.c
++++ b/src/lib/sendto.c
+@@ -73,6 +73,7 @@ libc_sendto:
+ LIBC_SENDTO_DECL
+ {
+ 	if (!tsocks_libc_sendto) {
++		tsocks_initialize();
+ 		tsocks_libc_sendto = tsocks_find_libc_symbol(
+ 				LIBC_SENDTO_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+diff --git a/src/lib/socket.c b/src/lib/socket.c
+index bdac610..edc24ab 100644
+--- a/src/lib/socket.c
++++ b/src/lib/socket.c
+@@ -72,5 +72,7 @@ end:
+  */
+ LIBC_SOCKET_DECL
+ {
++	if (!tsocks_libc_socket)
++		tsocks_initialize();
+ 	return tsocks_socket(LIBC_SOCKET_ARGS);
+ }
+diff --git a/src/lib/socketpair.c b/src/lib/socketpair.c
+index c1c70f7..263e4d8 100644
+--- a/src/lib/socketpair.c
++++ b/src/lib/socketpair.c
+@@ -48,7 +48,7 @@ LIBC_SOCKETPAIR_RET_TYPE tsocks_socketpair(LIBC_SOCKETPAIR_SIG)
+ LIBC_SOCKETPAIR_DECL
+ {
+ 	if (!tsocks_libc_socketpair) {
+-		/* Find symbol if not already set. Exit if not found. */
++		tsocks_initialize();
+ 		tsocks_libc_socketpair = tsocks_find_libc_symbol(
+ 				LIBC_SOCKETPAIR_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+diff --git a/src/lib/syscall.c b/src/lib/syscall.c
+index ec10000..bcf1035 100644
+--- a/src/lib/syscall.c
++++ b/src/lib/syscall.c
+@@ -252,6 +252,7 @@ LIBC_SYSCALL_DECL
+ 	va_list args;
+ 
+ 	if (!tsocks_libc_syscall) {
++		tsocks_initialize();
+ 		tsocks_libc_syscall= tsocks_find_libc_symbol(
+ 				LIBC_SYSCALL_NAME_STR, TSOCKS_SYM_EXIT_NOT_FOUND);
+ 	}
+diff --git a/src/lib/torsocks.c b/src/lib/torsocks.c
+index 5734af1..09de48d 100644
+--- a/src/lib/torsocks.c
++++ b/src/lib/torsocks.c
+@@ -47,8 +47,11 @@ struct configuration tsocks_config;
+  */
+ struct onion_pool tsocks_onion_pool;
+ 
++/* Indicate if the library was initialized previously. */
++static TSOCKS_INIT_ONCE(init_once);
++
+ /* Indicate if the library was cleaned up previously. */
+-unsigned int tsocks_cleaned_up = 0;
++static TSOCKS_INIT_ONCE(term_once);
+ 
+ /*
+  * Set to 1 if the binary is set with suid or 0 if not. This is set once during
+@@ -273,7 +276,7 @@ static void init_logging(void)
+  * Lib constructor. Initialize torsocks here before the main execution of the
+  * binary we are preloading.
+  */
+-static void __attribute__((constructor)) tsocks_init(void)
++static void tsocks_init(void)
+ {
+ 	int ret;
+ 
+@@ -311,9 +314,14 @@ static void __attribute__((constructor)) tsocks_init(void)
+ /*
+  * Lib destructor.
+  */
+-static void __attribute__((destructor)) tsocks_exit(void)
++static void tsocks_exit(void)
+ {
+-	tsocks_cleanup();
++	/* Cleanup every entries in the onion pool. */
++	onion_pool_destroy(&tsocks_onion_pool);
++	/* Cleanup allocated memory in the config file. */
++	config_file_destroy(&tsocks_config.conf_file);
++	/* Clean up logging. */
++	log_destroy();
+ }
+ 
+ /*
+@@ -605,20 +613,16 @@ void *tsocks_find_libc_symbol(const char *symbol,
+ }
+ 
+ /*
++ * Initialize torsocks library.
++ */
++void __attribute__((constructor)) tsocks_initialize(void) {
++	tsocks_once(&init_once, &tsocks_init);
++}
++
++/*
+  * Cleanup torsocks library memory and open fd.
+  */
+-void tsocks_cleanup(void)
++void __attribute__((destructor)) tsocks_cleanup(void)
+ {
+-	if (tsocks_cleaned_up) {
+-		return;
+-	}
+-
+-	/* Cleanup every entries in the onion pool. */
+-	onion_pool_destroy(&tsocks_onion_pool);
+-	/* Cleanup allocated memory in the config file. */
+-	config_file_destroy(&tsocks_config.conf_file);
+-	/* Clean up logging. */
+-	log_destroy();
+-
+-	tsocks_cleaned_up = 1;
++	tsocks_once(&term_once, &tsocks_exit);
+ }
+diff --git a/src/lib/torsocks.h b/src/lib/torsocks.h
+index 3b9cda2..7741c83 100644
+--- a/src/lib/torsocks.h
++++ b/src/lib/torsocks.h
+@@ -421,6 +421,7 @@ void *tsocks_find_libc_symbol(const char *symbol,
+ 		enum tsocks_sym_action action);
+ int tsocks_tor_resolve(int af, const char *hostname, void *ip_addr);
+ int tsocks_tor_resolve_ptr(const char *addr, char **ip, int af);
++void tsocks_initialize(void);
+ void tsocks_cleanup(void);
+ 
+ #endif /* TORSOCKS_H */
+-- 
+2.3.5
+

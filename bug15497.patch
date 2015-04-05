@@ -1,0 +1,108 @@
+From 2c060e39201effd50d28a6107135fda9ea2ce908 Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Sat, 28 Mar 2015 15:23:07 +0000
+Subject: [PATCH 1/1] Fix the broken getpeername() implementation.
+
+Signed-off-by: Yawning Angel <yawning@schwanenlied.me>
+---
+ src/lib/getpeername.c    | 24 +++++++++---------------
+ tests/test_getpeername.c | 12 +++++++-----
+ 2 files changed, 16 insertions(+), 20 deletions(-)
+
+diff --git a/src/lib/getpeername.c b/src/lib/getpeername.c
+index bd93a2b..d8bf701 100644
+--- a/src/lib/getpeername.c
++++ b/src/lib/getpeername.c
+@@ -33,6 +33,7 @@ LIBC_GETPEERNAME_RET_TYPE tsocks_getpeername(LIBC_GETPEERNAME_SIG)
+ {
+ 	int ret = 0;
+ 	struct connection *conn;
++	socklen_t sz = 0;
+ 
+ 	DBG("[getpeername] Requesting address on socket %d", sockfd);
+ 
+@@ -51,19 +52,9 @@ LIBC_GETPEERNAME_RET_TYPE tsocks_getpeername(LIBC_GETPEERNAME_SIG)
+ 	}
+ 
+ 	/*
+-	 * Extra check for addrlen since we are about to copy the connection
+-	 * content into the given address.
+-	 */
+-	if (*addrlen > sizeof(struct sockaddr)) {
+-		/* Ref to the manpage for the returned value here. */
+-		errno = EINVAL;
+-		ret = -1;
+-		goto end;
+-	}
+-
+-	/*
+-	 * Copy connected destination address into the given addr with only the
+-	 * given len so we don't overflow on purpose.
++	 * Copy the minimum of *addrlen and the size of the actual address
++	 * into the given addr. There are applications that pass in buffers
++	 * that are rather large, which is acceptable behavior.
+ 	 */
+ 	switch (conn->dest_addr.domain) {
+ 	case CONNECTION_DOMAIN_NAME:
+@@ -73,16 +64,19 @@ LIBC_GETPEERNAME_RET_TYPE tsocks_getpeername(LIBC_GETPEERNAME_SIG)
+ 		 * that has been returned to the application.
+ 		 */
+ 	case CONNECTION_DOMAIN_INET:
++		sz = min(sizeof(conn->dest_addr.u.sin), *addrlen);
+ 		memcpy(addr, (const struct sockaddr *) &conn->dest_addr.u.sin,
+-				*addrlen);
++				sz);
+ 		break;
+ 	case CONNECTION_DOMAIN_INET6:
++		sz = min(sizeof(conn->dest_addr.u.sin6), *addrlen);
+ 		memcpy(addr, (const struct sockaddr *) &conn->dest_addr.u.sin6,
+-				*addrlen);
++				sz);
+ 		break;
+ 	}
+ 
+ 	/* Success. */
++	*addrlen = sz;
+ 	errno = 0;
+ 	ret = 0;
+ 
+diff --git a/tests/test_getpeername.c b/tests/test_getpeername.c
+index 516596e..df464d2 100644
+--- a/tests/test_getpeername.c
++++ b/tests/test_getpeername.c
+@@ -32,6 +32,7 @@ static void test_getpeername(void)
+ 	char buf[INET_ADDRSTRLEN];
+ 	struct sockaddr addr;
+ 	struct sockaddr_in addrv4;
++	struct sockaddr_storage ss;
+ 	socklen_t addrlen;
+ 	const char *ip = "93.95.227.222";
+ 
+@@ -68,11 +69,7 @@ static void test_getpeername(void)
+ 		goto error;
+ 	}
+ 
+-	/* Very large addrlen. */
+-	addrlen = -1;
+-	ret = getpeername(inet_sock, &addr, &addrlen);
+-	ok(ret == -1 && errno == EINVAL, "Invalid addrlen");
+-
++	/* Invalid arguments */
+ 	addrlen = sizeof(addr);
+ 	ret = getpeername(inet_sock, NULL, &addrlen);
+ 	ok(ret == -1 && errno == EFAULT, "Invalid addr ptr");
+@@ -90,6 +87,11 @@ static void test_getpeername(void)
+ 	ok(ret == 0 && strncmp(buf, ip, strlen(ip)) == 0,
+ 			"Valid returned IP address from getpeername()");
+ 
++	/* Large but valid addrlen. */
++	addrlen = sizeof(ss);
++	ret = getpeername(inet_sock, (struct sockaddr *)&ss, &addrlen);
++	ok(ret == 0 && addrlen == sizeof(addrv4), "Valid returned IP address from getpeername(), large addrlen");
++
+ error:
+ 	if (inet_sock >= 0) {
+ 		close(inet_sock);
+-- 
+2.3.5
+

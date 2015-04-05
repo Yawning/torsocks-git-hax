@@ -1,0 +1,131 @@
+From e428ae4bbea17cab194a8c3acd99bc44614b0901 Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Sat, 28 Mar 2015 13:55:55 +0000
+Subject: [PATCH 1/1] Support certain Linux specific syscalls.
+
+This adds support for the following non-portable Linux-isms:
+ * gettid(2)
+ * getrandom(2)
+ * futex(2)
+
+The futex(2) support assumes a semi-modern kernel (>= 2.6.7) as the
+futex system call had an extra argument added at that time.
+
+Signed-off-by: Yawning Angel <yawning@schwanenlied.me>
+---
+ src/common/compat.h | 12 +++++++++++
+ src/lib/syscall.c   | 61 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/src/common/compat.h b/src/common/compat.h
+index 766b1fd..6fca641 100644
+--- a/src/common/compat.h
++++ b/src/common/compat.h
+@@ -84,6 +84,15 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ #ifndef __NR_recvmsg
+ #define __NR_recvmsg -9
+ #endif
++#ifndef __NR_gettid
++#define __NR_gettid -10
++#endif
++#ifndef __NR_getrandom
++#define __NR_getrandom -11
++#endif
++#ifndef __NR_futex
++#define __NR_futex -12
++#endif
+ 
+ #define TSOCKS_NR_SOCKET    __NR_socket
+ #define TSOCKS_NR_CONNECT   __NR_connect
+@@ -94,6 +103,9 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ #define TSOCKS_NR_GETPEERNAME __NR_getpeername
+ #define TSOCKS_NR_LISTEN    __NR_listen
+ #define TSOCKS_NR_RECVMSG   __NR_recvmsg
++#define TSOCKS_NR_GETTID    __NR_gettid
++#define TSOCKS_NR_GETRANDOM __NR_getrandom
++#define TSOCKS_NR_FUTEX     __NR_futex
+ 
+ #endif /* __linux__ */
+ 
+diff --git a/src/lib/syscall.c b/src/lib/syscall.c
+index ec10000..52ee4c2 100644
+--- a/src/lib/syscall.c
++++ b/src/lib/syscall.c
+@@ -164,6 +164,56 @@ static LIBC_RECVMSG_RET_TYPE handle_recvmsg(va_list args)
+ 	return tsocks_recvmsg(sockfd, msg, flags);
+ }
+ 
++#if defined(__linux__)
++/*
++ * Handle gettid(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_gettid(void)
++{
++	return tsocks_libc_syscall(TSOCKS_NR_GETTID);
++}
++
++/*
++ * Handle getrandom(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_getrandom(va_list args)
++{
++	void *buf;
++	size_t buflen;
++	unsigned int flags;
++
++	buf = va_arg(args, __typeof__(buf));
++	buflen = va_arg(args, __typeof__(buflen));
++	flags = va_arg(args, __typeof__(flags));
++
++	return tsocks_libc_syscall(TSOCKS_NR_GETRANDOM, buf, buflen, flags);
++}
++
++/*
++ * Handle futex(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_futex(va_list args)
++{
++	/* This assumes Linux 2.6.7 or later, as that is when 'val3' was
++	 * added to futex(2).  Kernel versions prior to that are what I
++	 * would consider historic.
++	 */
++	const struct timespec *timeout;
++	int *uaddr, *uaddr2;
++	int op, val, val3;
++
++	uaddr = va_arg(args, __typeof__(uaddr));
++	op = va_arg(args, __typeof__(op));
++	val = va_arg(args, __typeof__(val));
++	timeout = va_arg(args, __typeof__(timeout));
++	uaddr2 = va_arg(args, __typeof__(uaddr2));
++	val3 = va_arg(args, __typeof__(val3));
++
++	return tsocks_libc_syscall(TSOCKS_NR_FUTEX, uaddr, op, val, timeout,
++			uaddr2, val3);
++}
++#endif /* __linux__ */
++
+ /*
+  * Torsocks call for syscall(2)
+  */
+@@ -228,6 +278,17 @@ LIBC_SYSCALL_RET_TYPE tsocks_syscall(long int number, va_list args)
+ 	case TSOCKS_NR_RECVMSG:
+ 		ret = handle_recvmsg(args);
+ 		break;
++#if defined(__linux__)
++	case TSOCKS_NR_GETTID:
++		ret = handle_gettid();
++		break;
++	case TSOCKS_NR_GETRANDOM:
++		ret = handle_getrandom(args);
++		break;
++	case TSOCKS_NR_FUTEX:
++		ret = handle_futex(args);
++		break;
++#endif /* __linux__ */
+ 	default:
+ 		/*
+ 		 * Because of the design of syscall(), we can't pass a va_list to it so
+-- 
+2.3.5
+
