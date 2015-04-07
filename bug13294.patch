@@ -1,7 +1,7 @@
 From e428ae4bbea17cab194a8c3acd99bc44614b0901 Mon Sep 17 00:00:00 2001
 From: Yawning Angel <yawning@schwanenlied.me>
 Date: Sat, 28 Mar 2015 13:55:55 +0000
-Subject: [PATCH 1/1] Support certain Linux specific syscalls.
+Subject: [PATCH 1/5] Support certain Linux specific syscalls.
 
 This adds support for the following non-portable Linux-isms:
  * gettid(2)
@@ -126,6 +126,444 @@ index ec10000..52ee4c2 100644
  	default:
  		/*
  		 * Because of the design of syscall(), we can't pass a va_list to it so
+-- 
+2.3.5
+
+
+From 53b8569f545c45a443e746695f6b1b5de64fb65a Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Tue, 7 Apr 2015 10:38:15 +0000
+Subject: [PATCH 2/5] Handle accept4(2) when invoked via syscall().
+
+Signed-off-by: Yawning Angel <yawning@schwanenlied.me>
+---
+ src/common/compat.h |  4 ++++
+ src/lib/syscall.c   | 21 +++++++++++++++++++++
+ src/lib/torsocks.h  |  1 +
+ 3 files changed, 26 insertions(+)
+
+diff --git a/src/common/compat.h b/src/common/compat.h
+index 6fca641..b4bef9a 100644
+--- a/src/common/compat.h
++++ b/src/common/compat.h
+@@ -93,6 +93,9 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ #ifndef __NR_futex
+ #define __NR_futex -12
+ #endif
++#ifndef __NR_accept4
++#define __NR_accept4 -13
++#endif
+ 
+ #define TSOCKS_NR_SOCKET    __NR_socket
+ #define TSOCKS_NR_CONNECT   __NR_connect
+@@ -106,6 +109,7 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ #define TSOCKS_NR_GETTID    __NR_gettid
+ #define TSOCKS_NR_GETRANDOM __NR_getrandom
+ #define TSOCKS_NR_FUTEX     __NR_futex
++#define TSOCKS_NR_ACCEPT4   __NR_accept4
+ 
+ #endif /* __linux__ */
+ 
+diff --git a/src/lib/syscall.c b/src/lib/syscall.c
+index 52ee4c2..5dad3ce 100644
+--- a/src/lib/syscall.c
++++ b/src/lib/syscall.c
+@@ -212,6 +212,24 @@ static LIBC_SYSCALL_RET_TYPE handle_futex(va_list args)
+ 	return tsocks_libc_syscall(TSOCKS_NR_FUTEX, uaddr, op, val, timeout,
+ 			uaddr2, val3);
+ }
++
++/*
++ * Handle accept4(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_accept4(va_list args)
++{
++	int sockfd;
++	struct sockaddr *addr;
++	socklen_t addrlen;
++	int flags;
++
++	sockfd = va_arg(args, __typeof__(sockfd));
++	addr = va_arg(args, __typeof__(addr));
++	addrlen = va_arg(args, __typeof__(addrlen));
++	flags = va_arg(args, __typeof__(flags));
++
++	return tsocks_accept4(sockfd, addr, &addrlen, flags);
++}
+ #endif /* __linux__ */
+ 
+ /*
+@@ -288,6 +306,9 @@ LIBC_SYSCALL_RET_TYPE tsocks_syscall(long int number, va_list args)
+ 	case TSOCKS_NR_FUTEX:
+ 		ret = handle_futex(args);
+ 		break;
++	case TSOCKS_NR_ACCEPT4:
++		ret = handle_accept4(args);
++		break;
+ #endif /* __linux__ */
+ 	default:
+ 		/*
+diff --git a/src/lib/torsocks.h b/src/lib/torsocks.h
+index 3b9cda2..81073cf 100644
+--- a/src/lib/torsocks.h
++++ b/src/lib/torsocks.h
+@@ -388,6 +388,7 @@ TSOCKS_DECL(accept, LIBC_ACCEPT_RET_TYPE, LIBC_ACCEPT_SIG)
+ /* accept4(2) */
+ #if (defined(__linux__))
+ extern TSOCKS_LIBC_DECL(accept4, LIBC_ACCEPT4_RET_TYPE, LIBC_ACCEPT4_SIG)
++TSOCKS_DECL(accept4, LIBC_ACCEPT4_RET_TYPE, LIBC_ACCEPT4_SIG)
+ #define LIBC_ACCEPT4_DECL LIBC_ACCEPT4_RET_TYPE \
+ 		LIBC_ACCEPT4_NAME(LIBC_ACCEPT4_SIG)
+ #endif
+-- 
+2.3.5
+
+
+From 5e7d572a52a8fe6774d3b5d3177eb12461a234b7 Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Tue, 7 Apr 2015 11:10:47 +0000
+Subject: [PATCH 3/5] Support the various epoll routines when invoked via
+ syscall().
+
+Signed-off-by: Yawning Angel <yawning@schwanenlied.me>
+---
+ src/common/compat.h | 26 +++++++++++++++++
+ src/lib/syscall.c   | 80 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 106 insertions(+)
+
+diff --git a/src/common/compat.h b/src/common/compat.h
+index b4bef9a..8c3be78 100644
+--- a/src/common/compat.h
++++ b/src/common/compat.h
+@@ -111,6 +111,32 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ #define TSOCKS_NR_FUTEX     __NR_futex
+ #define TSOCKS_NR_ACCEPT4   __NR_accept4
+ 
++/*
++ * Despite glibc providing wrappers for these calls for a long time
++ * (as in "even Debian squeeze has all the wrappers"), libuv decided to
++ * use syscall() to invoke them instead.
++ */
++
++#include <sys/epoll.h>
++
++#ifndef __NR_epoll_create1
++#define __NR_epoll_create1 -128
++#endif
++#ifndef __NR_epoll_wait
++#define __NR_epoll_wait -129
++#endif
++#ifndef __NR_epoll_pwait
++#define __NR_epoll_pwait -130
++#endif
++#ifndef __NR_epoll_ctl
++#define __NR_epoll_ctl -131
++#endif
++
++#define TSOCKS_NR_EPOLL_CREATE1 __NR_epoll_create1
++#define TSOCKS_NR_EPOLL_WAIT    __NR_epoll_wait
++#define TSOCKS_NR_EPOLL_PWAIT   __NR_epoll_pwait
++#define TSOCKS_NR_EPOLL_CTL     __NR_epoll_ctl
++
+ #endif /* __linux__ */
+ 
+ #if (defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__darwin__) || defined(__NetBSD__))
+diff --git a/src/lib/syscall.c b/src/lib/syscall.c
+index 5dad3ce..c6585a8 100644
+--- a/src/lib/syscall.c
++++ b/src/lib/syscall.c
+@@ -230,6 +230,74 @@ static LIBC_SYSCALL_RET_TYPE handle_accept4(va_list args)
+ 
+ 	return tsocks_accept4(sockfd, addr, &addrlen, flags);
+ }
++
++/*
++ * Handle epoll_create1(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_epoll_create1(va_list args)
++{
++	int flags;
++
++	flags = va_arg(args, __typeof__(flags));
++
++	return epoll_create1(flags);
++}
++
++/*
++ * Handle epoll_wait(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_epoll_wait(va_list args)
++{
++	int epfd;
++	struct epoll_event *events;
++	int maxevents;
++	int timeout;
++
++	epfd = va_arg(args, __typeof__(epfd));
++	events = va_arg(args, __typeof__(events));
++	maxevents = va_arg(args, __typeof__(maxevents));
++	timeout = va_arg(args, __typeof__(maxevents));
++
++	return epoll_wait(epfd, events, maxevents, timeout);
++}
++
++/*
++ * Handle epoll_pwait(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_epoll_pwait(va_list args)
++{
++	int epfd;
++	struct epoll_event *events;
++	int maxevents;
++	int timeout;
++	const sigset_t *sigmask;
++
++	epfd = va_arg(args, __typeof__(epfd));
++	events = va_arg(args, __typeof__(events));
++	maxevents = va_arg(args, __typeof__(maxevents));
++	timeout = va_arg(args, __typeof__(maxevents));
++	sigmask = va_arg(args, __typeof__(sigmask));
++
++	return epoll_pwait(epfd, events, maxevents, timeout, sigmask);
++}
++
++/*
++ * Handle epoll_ctl(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_epoll_ctl(va_list args)
++{
++	int epfd;
++	int op;
++	int fd;
++	struct epoll_event *event;
++
++	epfd = va_arg(args, __typeof__(epfd));
++	op = va_arg(args, __typeof__(op));
++	fd = va_arg(args, __typeof__(fd));
++	event = va_arg(args, __typeof__(event));
++
++	return epoll_ctl(epfd, op, fd, event);
++}
+ #endif /* __linux__ */
+ 
+ /*
+@@ -309,6 +377,18 @@ LIBC_SYSCALL_RET_TYPE tsocks_syscall(long int number, va_list args)
+ 	case TSOCKS_NR_ACCEPT4:
+ 		ret = handle_accept4(args);
+ 		break;
++	case TSOCKS_NR_EPOLL_CREATE1:
++		ret = handle_epoll_create1(args);
++		break;
++	case TSOCKS_NR_EPOLL_WAIT:
++		ret = handle_epoll_wait(args);
++		break;
++	case TSOCKS_NR_EPOLL_PWAIT:
++		ret = handle_epoll_pwait(args);
++		break;
++	case TSOCKS_NR_EPOLL_CTL:
++		ret = handle_epoll_ctl(args);
++		break;
+ #endif /* __linux__ */
+ 	default:
+ 		/*
+-- 
+2.3.5
+
+
+From d6d79e31abe97b55ea944e13e134813aabe1bc86 Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Tue, 7 Apr 2015 11:28:53 +0000
+Subject: [PATCH 4/5] Support the eventfd2(2) syscall.
+
+Signed-off-by: Yawning Angel <yawning@schwanenlied.me>
+---
+ src/common/compat.h |  5 +++++
+ src/lib/syscall.c   | 17 +++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/src/common/compat.h b/src/common/compat.h
+index 8c3be78..187818c 100644
+--- a/src/common/compat.h
++++ b/src/common/compat.h
+@@ -118,6 +118,7 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+  */
+ 
+ #include <sys/epoll.h>
++#include <sys/eventfd.h>
+ 
+ #ifndef __NR_epoll_create1
+ #define __NR_epoll_create1 -128
+@@ -131,11 +132,15 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ #ifndef __NR_epoll_ctl
+ #define __NR_epoll_ctl -131
+ #endif
++#ifndef __NR_eventfd2
++#define __NR_eventfd2 -132
++#endif
+ 
+ #define TSOCKS_NR_EPOLL_CREATE1 __NR_epoll_create1
+ #define TSOCKS_NR_EPOLL_WAIT    __NR_epoll_wait
+ #define TSOCKS_NR_EPOLL_PWAIT   __NR_epoll_pwait
+ #define TSOCKS_NR_EPOLL_CTL     __NR_epoll_ctl
++#define TSOCKS_NR_EVENTFD2      __NR_eventfd2
+ 
+ #endif /* __linux__ */
+ 
+diff --git a/src/lib/syscall.c b/src/lib/syscall.c
+index c6585a8..55e2447 100644
+--- a/src/lib/syscall.c
++++ b/src/lib/syscall.c
+@@ -298,6 +298,20 @@ static LIBC_SYSCALL_RET_TYPE handle_epoll_ctl(va_list args)
+ 
+ 	return epoll_ctl(epfd, op, fd, event);
+ }
++
++/*
++ * Handle eventfd2(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_eventfd2(va_list args)
++{
++	unsigned int initval;
++	int flags;
++
++	initval = va_arg(args, __typeof__(initval));
++	flags = va_arg(args, __typeof__(flags));
++
++	return eventfd(initval, flags);
++}
+ #endif /* __linux__ */
+ 
+ /*
+@@ -389,6 +403,9 @@ LIBC_SYSCALL_RET_TYPE tsocks_syscall(long int number, va_list args)
+ 	case TSOCKS_NR_EPOLL_CTL:
+ 		ret = handle_epoll_ctl(args);
+ 		break;
++	case TSOCKS_NR_EVENTFD2:
++		ret = handle_eventfd2(args);
++		break;
+ #endif /* __linux__ */
+ 	default:
+ 		/*
+-- 
+2.3.5
+
+
+From 824d88b9e47f8e2f3e5a3158f440154a04c2eb55 Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Tue, 7 Apr 2015 11:37:41 +0000
+Subject: [PATCH 5/5] Add support for the various inotify routines when invoked
+ via syscall().
+
+Signed-off-by: Yawning Angel <yawning@schwanenlied.me>
+---
+ src/common/compat.h | 13 +++++++++++++
+ src/lib/syscall.c   | 49 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/src/common/compat.h b/src/common/compat.h
+index 187818c..e7e5812 100644
+--- a/src/common/compat.h
++++ b/src/common/compat.h
+@@ -119,6 +119,7 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ 
+ #include <sys/epoll.h>
+ #include <sys/eventfd.h>
++#include <sys/inotify.h>
+ 
+ #ifndef __NR_epoll_create1
+ #define __NR_epoll_create1 -128
+@@ -135,12 +136,24 @@ void tsocks_mutex_unlock(tsocks_mutex_t *m);
+ #ifndef __NR_eventfd2
+ #define __NR_eventfd2 -132
+ #endif
++#ifndef __NR_inotify_init1
++#define __NR_inotify_init1 -133
++#endif
++#ifndef __NR_inotify_add_watch
++#define __NR_inotify_add_watch -134
++#endif
++#ifndef __NR_inotify_rm_watch
++#define __NR_inotify_rm_watch -135
++#endif
+ 
+ #define TSOCKS_NR_EPOLL_CREATE1 __NR_epoll_create1
+ #define TSOCKS_NR_EPOLL_WAIT    __NR_epoll_wait
+ #define TSOCKS_NR_EPOLL_PWAIT   __NR_epoll_pwait
+ #define TSOCKS_NR_EPOLL_CTL     __NR_epoll_ctl
+ #define TSOCKS_NR_EVENTFD2      __NR_eventfd2
++#define TSOCKS_NR_INOTIFY_INIT1 __NR_inotify_init1
++#define TSOCKS_NR_INOTIFY_ADD_WATCH __NR_inotify_add_watch
++#define TSOCKS_NR_INOTIFY_RM_WATCH  __NR_inotify_rm_watch
+ 
+ #endif /* __linux__ */
+ 
+diff --git a/src/lib/syscall.c b/src/lib/syscall.c
+index 55e2447..c3bbd56 100644
+--- a/src/lib/syscall.c
++++ b/src/lib/syscall.c
+@@ -312,6 +312,46 @@ static LIBC_SYSCALL_RET_TYPE handle_eventfd2(va_list args)
+ 
+ 	return eventfd(initval, flags);
+ }
++
++/*
++ * Handle inotify_init1(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_inotify_init1(va_list args)
++{
++	int flags;
++	flags = va_arg(args, __typeof__(flags));
++
++	return inotify_init1(flags);
++}
++
++/*
++ * Handle inotify_add_watch(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_inotify_add_watch(va_list args)
++{
++	int fd;
++	const char *pathname;
++	uint32_t mask;
++
++	fd = va_arg(args, __typeof__(fd));
++	pathname = va_arg(args, __typeof__(pathname));
++	mask = va_arg(args, __typeof__(mask));
++
++	return inotify_add_watch(fd, pathname, mask);
++}
++
++/*
++ * Handle inotify_rm_watch(2) syscall.
++ */
++static LIBC_SYSCALL_RET_TYPE handle_inotify_rm_watch(va_list args)
++{
++	int fd, wd;
++
++	fd = va_arg(args, __typeof__(fd));
++	wd = va_arg(args, __typeof__(wd));
++
++	return inotify_rm_watch(fd, wd);
++}
+ #endif /* __linux__ */
+ 
+ /*
+@@ -406,6 +446,15 @@ LIBC_SYSCALL_RET_TYPE tsocks_syscall(long int number, va_list args)
+ 	case TSOCKS_NR_EVENTFD2:
+ 		ret = handle_eventfd2(args);
+ 		break;
++	case TSOCKS_NR_INOTIFY_INIT1:
++		ret = handle_inotify_init1(args);
++		break;
++	case TSOCKS_NR_INOTIFY_ADD_WATCH:
++		ret = handle_inotify_add_watch(args);
++		break;
++	case TSOCKS_NR_INOTIFY_RM_WATCH:
++		ret = handle_inotify_rm_watch(args);
++		break;
+ #endif /* __linux__ */
+ 	default:
+ 		/*
 -- 
 2.3.5
 
