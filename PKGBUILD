@@ -42,6 +42,8 @@ pkgver () {
 
 prepare() {
     cd "$srcdir/torsocks"
+    export GIT_COMMITTER_NAME="nobody"
+    export GIT_COMMITTER_EMAIL="nobody@localhost"
     git am "$srcdir/bug13294.patch"
     git am "$srcdir/bug15497.patch"
     git am "$srcdir/bug15504.patch"
