@@ -6,13 +6,10 @@
 # WARNING: The extra patches applied are all considered EXPERIMENTAL, and bad
 # things may happen to security or anonymity if used.
 #
-#  * bug13294 - Add support for gettid, getrandom, futex.
-#  * bug15497 - Fix the broken getpeername implementation.
-#  * bug15504 - Fix the broken getaddrinfo implementation.
 #  * bug15584 - Fix the SIGSEGV encountered with certain C++ apps.
 
 pkgname=torsocks-git-hax
-pkgver=2.0.0.17.gbd6ae94
+pkgver=2.0.0.27.gbb972f4
 epoch=1
 pkgrel=1
 pkgdesc='Torsocks allows you to use most socks-friendly applications in a safe way with Tor.'
@@ -25,14 +22,8 @@ provides=('torsocks')
 options=(!strip)
 
 source=("git+https://git.torproject.org/torsocks.git"
-        'bug13294.patch'
-        'bug15497.patch'
-        'bug15504.patch'
         'bug15584.patch')
 sha256sums=('SKIP'
-            '8092d5e39d6bca4373537a3880a33ae8b2d4552752e8ce0e23411f787ebf0c7d'
-            'ebda13ac82dd002a444f188257051a2b90514b6a00eaa3f7dce04bd0a4e13fcd'
-            'b875c5594365938c76d0d342604b669e519876dfd76b91d793d3a01c4abc6962'
             '69168263f994b98622b2266780dbf355e39cfab897b6f555d43da76d30064b5b')
 
 pkgver () {
@@ -44,9 +35,6 @@ prepare() {
     cd "$srcdir/torsocks"
     export GIT_COMMITTER_NAME="nobody"
     export GIT_COMMITTER_EMAIL="nobody@localhost"
-    git am "$srcdir/bug13294.patch"
-    git am "$srcdir/bug15497.patch"
-    git am "$srcdir/bug15504.patch"
     git am "$srcdir/bug15584.patch"
     ./autogen.sh
 }
