@@ -24,7 +24,7 @@ options=(!strip)
 source=("git+https://git.torproject.org/torsocks.git"
         'bug15584.patch')
 sha256sums=('SKIP'
-            '69168263f994b98622b2266780dbf355e39cfab897b6f555d43da76d30064b5b')
+            '536acb63f5d6404ae21735b7ba161a783b8a88963169a62d3e82f85b9682134b')
 
 pkgver () {
     cd "$srcdir/torsocks"
