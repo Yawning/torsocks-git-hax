@@ -7,6 +7,7 @@
 # things may happen to security or anonymity if used.
 #
 #  * bug15584 - Fix the SIGSEGV encountered with certain C++ apps.
+#  * bug16006 - Add IsolatePID.
 
 pkgname=torsocks-git-hax
 pkgver=2.0.0.27.gbb972f4
@@ -22,9 +23,11 @@ provides=('torsocks')
 options=(!strip)
 
 source=("git+https://git.torproject.org/torsocks.git"
-        'bug15584.patch')
+        'bug15584.patch'
+        'bug16006.patch')
 sha256sums=('SKIP'
-            '536acb63f5d6404ae21735b7ba161a783b8a88963169a62d3e82f85b9682134b')
+            '536acb63f5d6404ae21735b7ba161a783b8a88963169a62d3e82f85b9682134b'
+            '0772fa5f5ca5c4d54ee2bedab486df4be038ea5206beada4b9f497946875c737')
 
 pkgver () {
     cd "$srcdir/torsocks"
@@ -36,6 +39,7 @@ prepare() {
     export GIT_COMMITTER_NAME="nobody"
     export GIT_COMMITTER_EMAIL="nobody@localhost"
     git am "$srcdir/bug15584.patch"
+    git am "$srcdir/bug16006.patch"
     ./autogen.sh
 }
 

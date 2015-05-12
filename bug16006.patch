@@ -1,0 +1,390 @@
+From 5640604a7d07f914e2c6711d0eb27c77a431cae7 Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Tue, 12 May 2015 11:37:27 +0000
+Subject: [PATCH 1/2] Send the SOCKS5 authentication for RESOLVE/RESOLVE_PTR
+ requests.
+
+Signed-off-by: Yawning Angel <yawning@schwanenlied.me>
+---
+ src/lib/torsocks.c | 50 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib/torsocks.c b/src/lib/torsocks.c
+index 09de48d..74b5534 100644
+--- a/src/lib/torsocks.c
++++ b/src/lib/torsocks.c
+@@ -465,6 +465,7 @@ int tsocks_tor_resolve(int af, const char *hostname, void *ip_addr)
+ 	int ret;
+ 	size_t addr_len;
+ 	struct connection conn;
++	uint8_t socks5_method;
+ 
+ 	assert(hostname);
+ 	assert(ip_addr);
+@@ -515,11 +516,33 @@ int tsocks_tor_resolve(int af, const char *hostname, void *ip_addr)
+ 		goto error;
+ 	}
+ 
+-	ret = setup_tor_connection(&conn, SOCKS5_NO_AUTH_METHOD);
++	/* Is this configuration is set to use SOCKS5 authentication. */
++	if (tsocks_config.socks5_use_auth) {
++		socks5_method = SOCKS5_USER_PASS_METHOD;
++	} else {
++		socks5_method = SOCKS5_NO_AUTH_METHOD;
++	}
++
++	ret = setup_tor_connection(&conn, socks5_method);
+ 	if (ret < 0) {
+ 		goto end_close;
+ 	}
+ 
++	/* For the user/pass method, send the request before resolve. */
++	if (socks5_method == SOCKS5_USER_PASS_METHOD) {
++		ret = socks5_send_user_pass_request(&conn,
++				tsocks_config.conf_file.socks5_username,
++				tsocks_config.conf_file.socks5_password);
++		if (ret < 0) {
++			goto end_close;
++		}
++
++		ret = socks5_recv_user_pass_reply(&conn);
++		if (ret < 0) {
++			goto end_close;
++		}
++	}
++
+ 	ret = socks5_send_resolve_request(hostname, &conn);
+ 	if (ret < 0) {
+ 		goto end_close;
+@@ -549,6 +572,7 @@ int tsocks_tor_resolve_ptr(const char *addr, char **ip, int af)
+ {
+ 	int ret;
+ 	struct connection conn;
++	uint8_t socks5_method;
+ 
+ 	assert(addr);
+ 	assert(ip);
+@@ -563,11 +587,33 @@ int tsocks_tor_resolve_ptr(const char *addr, char **ip, int af)
+ 	}
+ 	conn.dest_addr.domain = CONNECTION_DOMAIN_INET;
+ 
+-	ret = setup_tor_connection(&conn, SOCKS5_NO_AUTH_METHOD);
++	/* Is this configuration is set to use SOCKS5 authentication. */
++	if (tsocks_config.socks5_use_auth) {
++		socks5_method = SOCKS5_USER_PASS_METHOD;
++	} else {
++		socks5_method = SOCKS5_NO_AUTH_METHOD;
++	}
++
++	ret = setup_tor_connection(&conn, socks5_method);
+ 	if (ret < 0) {
+ 		goto end_close;
+ 	}
+ 
++	/* For the user/pass method, send the request before resolve ptr. */
++	if (socks5_method == SOCKS5_USER_PASS_METHOD) {
++		ret = socks5_send_user_pass_request(&conn,
++				tsocks_config.conf_file.socks5_username,
++				tsocks_config.conf_file.socks5_password);
++		if (ret < 0) {
++			goto end_close;
++		}
++
++		ret = socks5_recv_user_pass_reply(&conn);
++		if (ret < 0) {
++			goto end_close;
++		}
++	}
++
+ 	ret = socks5_send_resolve_ptr_request(&conn, addr, af);
+ 	if (ret < 0) {
+ 		goto end_close;
+-- 
+2.4.0
+
+
+From f5dea8e85f744f2e490c9f74a8057871f63b03fa Mon Sep 17 00:00:00 2001
+From: Yawning Angel <yawning@schwanenlied.me>
+Date: Tue, 12 May 2015 11:39:52 +0000
+Subject: [PATCH 2/2] Add IsolatePID.
+
+IsolatePID will have torsocks automatically derive a unique SOCKS5
+username/password pair of the form:
+
+  'torsocks-' PID ':' unixTime / '0'
+
+To provide automatic per-process isolation (Disabled by default).
+This behavior may be better for certain users/applications, and may
+also be controlled via the `TORSOCKS_ISOLATE_PID` env var.
+
+Implements #16006.
+
+Signed-off-by: Yawning Angel <yawning@schwanenlied.me>
+---
+ doc/torsocks.8           |  6 +++
+ doc/torsocks.conf        |  7 ++++
+ doc/torsocks.conf.5      |  8 ++++
+ src/common/config-file.c | 99 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/common/config-file.h | 10 +++++
+ src/common/defaults.h    |  3 ++
+ src/lib/torsocks.c       | 16 +++++++-
+ 7 files changed, 148 insertions(+), 1 deletion(-)
+
+diff --git a/doc/torsocks.8 b/doc/torsocks.8
+index 4a14703..ac3863a 100644
+--- a/doc/torsocks.8
++++ b/doc/torsocks.8
+@@ -99,6 +99,12 @@ also with the variable above.
+ Allow inbound connections so the application can accept and listen for
+ connections.
+ 
++.PP
++.IP TORSOCKS_ISOLATE_PID
++Set the username and password for the SOCKS5 authentication method to a
++PID/current time based value automatically. Username and Password MUST NOT
++be set.
++
+ .SH KNOWN ISSUES
+ 
+ .SS DNS
+diff --git a/doc/torsocks.conf b/doc/torsocks.conf
+index 7e82a27..b355b51 100644
+--- a/doc/torsocks.conf
++++ b/doc/torsocks.conf
+@@ -33,3 +33,10 @@ OnionAddrRange 127.42.42.0/24
+ # If set to 1, connect() will be allowed to be used to the loopback interface
+ # bypassing Tor. This option should not be used by most users. (Default: 0)
+ #AllowOutboundLocalhost 1
++
++# Set Torsocks to use an automatically generated SOCKS5 username/password
++# based on the process ID and current time, that makes the connections to Tor
++# use a different circuit from other existing streams in Tor on a per-process
++# basis.  If set, the SOCKS5Username and SOCKS5Password options must not be
++# set. (Default: 0)
++# IsolatePID 1
+diff --git a/doc/torsocks.conf.5 b/doc/torsocks.conf.5
+index 13ac7b9..33fba3e 100644
+--- a/doc/torsocks.conf.5
++++ b/doc/torsocks.conf.5
+@@ -83,6 +83,14 @@ Allow outbound connections to the loopback interface meaning that connect()
+ will be allowed to connect to localhost addresses bypassing Tor.  This option
+ should not be used by most users. (Default: 0)
+ 
++.TP
++.I IsolatePID 0|1
++Set Torsocks to use an automatically generated SOCKS5 username/password
++based on the process ID and current time, that makes the connections to Tor
++use a different circuit from other existing streams in Tor on a per-process
++basis.  If set, the SOCKS5Username and SOCKS5Password options must not be
++set. (Default: 0)
++
+ .SH EXAMPLE
+   $ export TORSOCKS_CONF_FILE=$PWD/torsocks.conf
+   $ torsocks ssh account@sshserver.com
+diff --git a/src/common/config-file.c b/src/common/config-file.c
+index 64b3d42..77881bf 100644
+--- a/src/common/config-file.c
++++ b/src/common/config-file.c
+@@ -39,6 +39,7 @@ static const char *conf_socks5_user_str = "SOCKS5Username";
+ static const char *conf_socks5_pass_str = "SOCKS5Password";
+ static const char *conf_allow_inbound_str = "AllowInbound";
+ static const char *conf_allow_outbound_localhost_str = "AllowOutboundLocalhost";
++static const char *conf_isolate_pid_str = "IsolatePID";
+ 
+ /*
+  * Once this value reaches 2, it means both user and password for a SOCKS5
+@@ -233,6 +234,11 @@ static int parse_config_line(const char *line, struct configuration *config)
+ 		if (ret < 0) {
+ 			goto error;
+ 		}
++	} else if (!strcmp(tokens[0], conf_isolate_pid_str)) {
++		ret = conf_file_set_isolate_pid(tokens[1], config);
++		if (ret < 0) {
++			goto error;
++		}
+ 	} else {
+ 		WARN("Config file contains unknown value: %s", line);
+ 	}
+@@ -402,6 +408,99 @@ int conf_file_set_allow_outbound_localhost(const char *val,
+ }
+ 
+ /*
++ * Set the isolate PID option for the given config.
++ *
++ * Return 0 if optiuon is off, 1 if on and negative value on error.
++ */
++ATTR_HIDDEN
++int conf_file_set_isolate_pid(const char *val, struct configuration *config)
++{
++	int ret;
++
++	assert(val);
++	assert(config);
++
++	ret = atoi(val);
++	if (ret == 0) {
++		config->isolate_pid = 0;
++		DBG("[config] PID isolation disabled.");
++	} else if (ret == 1) {
++		config->isolate_pid = 1;
++		DBG("[config] PID isolation enabled.");
++	} else {
++		ERR("[config] Invalid %s value for %s", val,
++				conf_isolate_pid_str);
++		ret = -EINVAL;
++	}
++
++	return ret;
++}
++
++/*
++ * Applies the SOCKS authentication configuration and sets the final SOCKS
++ * username and password.
++ *
++ * Return 0 if successful, and negative value on error.
++ */
++ATTR_HIDDEN
++int conf_apply_socks_auth(struct configuration *config)
++{
++	int ret;
++	pid_t pid;
++	time_t now;
++
++	assert(config);
++
++	if (!config->socks5_use_auth && !config->isolate_pid) {
++		/* No auth specified at all. */
++		ret = 0;
++		goto end;
++	} else if (config->socks5_use_auth && !config->isolate_pid) {
++		/* SOCKS5 auth specified by user, already setup. */
++		ret = 0;
++		goto end;
++	} else if (config->socks5_use_auth && config->isolate_pid) {
++		ERR("[config] IsolatePID and SOCKS5 auth both set.");
++		ret = -EINVAL;
++		goto end;
++	}
++
++
++	/* PID based isolation requested.
++	 *   Username: 'torsocks-' PID ':' TIME
++	 *   Password: '0'
++	 */
++
++	pid = getpid();
++	now = time(NULL);
++	ret = snprintf(config->conf_file.socks5_username,
++		       sizeof(config->conf_file.socks5_username),
++		       "torsocks-%ld:%lld", (long)pid, (long long int)now);
++	if (ret < 0 || ret >= (int)sizeof(config->conf_file.socks5_username)) {
++		ret = -ENOBUFS;
++		goto end;
++	}
++
++	ret = snprintf(config->conf_file.socks5_password,
++		       sizeof(config->conf_file.socks5_password),
++		       "0");
++	if (ret < 0 || ret >= (int)sizeof(config->conf_file.socks5_password)) {
++		ret = -ENOBUFS;
++		goto end;
++	}
++
++	DBG("[config]: IsolatePID: '%s'/'%s'",
++	    config->conf_file.socks5_username,
++	    config->conf_file.socks5_password);
++
++	config->socks5_use_auth = 1;
++	ret = 0;
++
++end:
++	return ret;
++}
++
++/*
+  * Read and populate the given config parsed data structure.
+  *
+  * Return 0 on success or else a negative value.
+diff --git a/src/common/config-file.h b/src/common/config-file.h
+index da3d507..23dd842 100644
+--- a/src/common/config-file.h
++++ b/src/common/config-file.h
+@@ -83,6 +83,13 @@ struct configuration {
+ 	 * Allow outbound connections to localhost that bypass Tor.
+ 	 */
+ 	unsigned int allow_outbound_localhost:1;
++
++	/*
++	 * Automatically set the SOCKS5 authentication to a unique per-process
++	 * value. If this value is set, the user MUST NOT have provided a
++	 * username or password.
++	 */
++	unsigned int isolate_pid:1;
+ };
+ 
+ int config_file_read(const char *filename, struct configuration *config);
+@@ -94,5 +101,8 @@ int conf_file_set_socks5_user(const char *username,
+ int conf_file_set_allow_inbound(const char *val, struct configuration *config);
+ int conf_file_set_allow_outbound_localhost(const char *val, struct
+ 		configuration *config);
++int conf_file_set_isolate_pid(const char *val, struct configuration *config);
++
++int conf_apply_socks_auth(struct configuration *config);
+ 
+ #endif /* CONFIG_FILE_H */
+diff --git a/src/common/defaults.h b/src/common/defaults.h
+index 36c7bc0..ab51690 100644
+--- a/src/common/defaults.h
++++ b/src/common/defaults.h
+@@ -66,4 +66,7 @@
+ /* Control if torsocks allows inbound connection or not. */
+ #define DEFAULT_ALLOW_INBOUND_ENV   "TORSOCKS_ALLOW_INBOUND"
+ 
++/* Control if torsocks isolates based on PID or not. */
++#define DEFAULT_ISOLATE_PID_ENV     "TORSOCKS_ISOLATE_PID"
++
+ #endif /* TORSOCKS_DEFAULTS_H */
+diff --git a/src/lib/torsocks.c b/src/lib/torsocks.c
+index 74b5534..cddff82 100644
+--- a/src/lib/torsocks.c
++++ b/src/lib/torsocks.c
+@@ -75,7 +75,7 @@ static void clean_exit(int status)
+ static void read_env(void)
+ {
+ 	int ret;
+-	const char *username, *password, *allow_in;
++	const char *username, *password, *allow_in, *isolate_pid;
+ 
+ 	if (is_suid) {
+ 		goto end;
+@@ -89,6 +89,14 @@ static void read_env(void)
+ 		}
+ 	}
+ 
++	isolate_pid = getenv(DEFAULT_ISOLATE_PID_ENV);
++	if (isolate_pid) {
++		ret = conf_file_set_isolate_pid(isolate_pid, &tsocks_config);
++		if (ret < 0) {
++			goto error;
++		}
++	}
++
+ 	username = getenv(DEFAULT_SOCKS5_USER_ENV);
+ 	password = getenv(DEFAULT_SOCKS5_PASS_ENV);
+ 	if (!username && !password) {
+@@ -181,6 +189,12 @@ static void init_config(void)
+ 
+ 	/* Handle possible env. variables. */
+ 	read_env();
++
++	/* Finalize the SOCKS auth (Isolation) settings. */
++	ret = conf_apply_socks_auth(&tsocks_config);
++	if (ret < 0) {
++		clean_exit(EXIT_FAILURE);
++	}
+ }
+ 
+ /*
+-- 
+2.4.0
+
